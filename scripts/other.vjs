@@ -1,0 +1,42 @@
+import { Entity, CSPlayerPawn, BaseModelEntity, Instance } from "cs_script/point_script";
+
+let bGlowing = false;
+
+Instance.OnScriptInput("setModelMamehinata", (context) => {
+    const activator = context.activator;
+    if (activator.GetClassName() === "player") {
+		Instance.Msg(bGlowing);
+        activator.SetModel("characters/models/mukumi/mamehinata.vmdl");
+    }
+    
+});
+
+Instance.OnScriptInput("randomColor", (context) => {
+    const activator = context.activator;
+    const r = Math.random() * 255
+    const g = Math.random() * 255
+    const b = Math.random() * 255
+	//Instance.Msg(r + '---' + g + '---' + b);
+    activator.SetColor({ r: r, g: g, b: b, a: 255 });
+});
+
+Instance.OnScriptInput("scaleUp", (context) => {
+    const activator = context.activator;
+    if (activator.GetClassName() === "player") {
+        activator.SetModelScale(2);
+    }
+});
+
+Instance.OnScriptInput("scaleNormal", (context) => {
+    const activator = context.activator;
+    if (activator.GetClassName() === "player") {
+        activator.SetModelScale(1);
+    }
+});
+
+Instance.OnScriptInput("scaleDown", (context) => {
+    const activator = context.activator;
+    if (activator.GetClassName() === "player") {
+        activator.SetModelScale(.5);
+    }
+});

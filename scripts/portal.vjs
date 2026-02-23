@@ -1,0 +1,291 @@
+import { Entity, CSPlayerPawn, BaseModelEntity, Instance } from "cs_script/point_script";
+
+const playerStates = Array(64).fill(null).map(() => ({
+    lastPortalTime: 0
+}));
+
+function angleToVector(angle) {
+    const pitch = angle.pitch * (Math.PI / 180);
+    const yaw = angle.yaw * (Math.PI / 180);
+    return {
+        x: Math.cos(pitch) * Math.cos(yaw),
+        y: Math.cos(pitch) * Math.sin(yaw),
+        z: -Math.sin(pitch)
+    };
+}
+function vectorToAngles(vec) {
+    const yaw = Math.atan2(vec.y, vec.x) * 180 / Math.PI;
+    const pitch = Math.atan2(-vec.z, Math.sqrt(vec.x * vec.x + vec.y * vec.y)) * 180 / Math.PI;
+    return { pitch, yaw, roll: 0 };
+}
+function angleToBasis(angle) {
+    const p = angle.pitch * (Math.PI / 180);
+    const y = angle.yaw * (Math.PI / 180);
+    const r = angle.roll * (Math.PI / 180);
+    const cp = Math.cos(p), sp = Math.sin(p);
+    const cy = Math.cos(y), sy = Math.sin(y);
+    const cr = Math.cos(r), sr = Math.sin(r);
+    const forward = {
+        x: cp * cy,
+        y: cp * sy,
+        z: -sp
+    };
+    const right = {
+        x: -sy * cr + sp * cy * sr,
+        y: cy * cr + sp * sy * sr,
+        z: cp * sr
+    };
+    const up = {
+        x: sy * sr + sp * cy * cr,
+        y: -cy * sr + sp * sy * cr,
+        z: cp * cr
+    };
+    return { forward, right, up };
+}
+// Проекция мировой точки в локальные координаты портала
+function worldToLocal(world, origin, basis) {
+    const rel = {
+        x: world.x - origin.x,
+        y: world.y - origin.y,
+        z: world.z - origin.z
+    };
+    return {
+        x: rel.x * basis.forward.x + rel.y * basis.forward.y + rel.z * basis.forward.z,
+        y: rel.x * basis.right.x + rel.y * basis.right.y + rel.z * basis.right.z,
+        z: rel.x * basis.up.x + rel.y * basis.up.y + rel.z * basis.up.z
+    };
+}
+// Обратная проекция из локальных координат портала в мировые
+function localToWorld(local, origin, basis) {
+    return {
+        x: origin.x + basis.forward.x * local.x + basis.right.x * local.y + basis.up.x * local.z,
+        y: origin.y + basis.forward.y * local.x + basis.right.y * local.y + basis.up.y * local.z,
+        z: origin.z + basis.forward.z * local.x + basis.right.z * local.y + basis.up.z * local.z
+    };
+}
+/**
+ * Визуализирует локальный базис (forward, right, up) любого Entity.
+ * - Красный маркер = forward (ось X)
+ * - Зелёный маркер = right   (ось Y)
+ * - Синий маркер = up      (ось Z)
+ *
+ * @param entity    – любая сущность (игрок, портал и т.п.)
+ * @param length    – длина осей в мире
+ * @param duration  – время жизни отладочных примитивов (в секундах)
+ */
+function debugBasis(entity, length = 32, duration = 5) {
+    // 1) Собираем точки
+    const origin = entity.GetAbsOrigin();
+    const angles = entity.GetAbsAngles();
+    const basis = angleToBasis(angles);
+    const forwardP = {
+        x: origin.x + basis.forward.x * length,
+        y: origin.y + basis.forward.y * length,
+        z: origin.z + basis.forward.z * length
+    };
+    const rightP = {
+        x: origin.x + basis.right.x * length,
+        y: origin.y + basis.right.y * length,
+        z: origin.z + basis.right.z * length
+    };
+    const upP = {
+        x: origin.x + basis.up.x * length,
+        y: origin.y + basis.up.y * length,
+        z: origin.z + basis.up.z * length
+    };
+    // 2) Рисуем сферы на концах осей
+    Instance.DebugSphere(forwardP, 4, duration, { r: 255, g: 0, b: 0, a: 255 });
+    Instance.DebugSphere(rightP, 4, duration, { r: 0, g: 255, b: 0, a: 255 });
+    Instance.DebugSphere(upP, 4, duration, { r: 0, g: 0, b: 255, a: 255 });
+}
+/**
+ * Given a world-space direction v and a portal basis,
+ * project v into that portal’s local axes.
+ */
+function worldVectorToLocal(v, basis) {
+    return {
+        x: dot(v, basis.forward),
+        y: dot(v, basis.right),
+        z: dot(v, basis.up)
+    };
+}
+/**
+ * Given a vector in portal-local space,
+ * re-express it back in world axes via that basis.
+ */
+function localVectorToWorld(v, basis) {
+    return {
+        x: basis.forward.x * v.x + basis.right.x * v.y + basis.up.x * v.z,
+        y: basis.forward.y * v.x + basis.right.y * v.y + basis.up.y * v.z,
+        z: basis.forward.z * v.x + basis.right.z * v.y + basis.up.z * v.z
+    };
+}
+function dot(a, b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+/**
+ * Simulate exactly how the player’s eye QAngle should transform through a portal.
+ *
+ * @param eyeAngles  – player.GetEyeAngles()
+ * @param entryAng   – entryPortal.GetAbsAngles()
+ * @param exitAng    – exitPortal.GetAbsAngles()
+ * @returns          – the new eye QAngle you should Teleport with
+ */
+export function simulateRotationThroughPortal(eyeAngles, entryAng, exitAng) {
+    // 1) Build each portal’s basis from its QAngle
+    //    (you already have this in your code)
+    const basisIn = angleToBasis(entryAng);
+    const basisOut = angleToBasis(exitAng);
+    // 2) Convert eye QAngle → forward vector
+    const eyeDir = angleToVector(eyeAngles);
+    // 3) Project that vector into entryPortal’s local space
+    let localDir = worldVectorToLocal(eyeDir, basisIn);
+    // 4) Mirror the forward‐axis so you don’t end up looking into
+    //    the portal plane but “out” of it
+    localDir.x = localDir.x;
+    // 5) Convert back into world space via exitPortal’s basis
+    const newDir = localVectorToWorld(localDir, basisOut);
+    // 6) Re-derive a QAngle from that world vector
+    const newEyeAngles = vectorToAngles(newDir);
+    return newEyeAngles;
+}
+// Integrate into your full teleport:
+/**
+ * Flips the portal-forward component of velocity so you exit
+ * moving “out” instead of straight through the wall.
+ */
+function simulateVelocityThroughPortal(velIn, entryAng, exitAng) {
+    // 1) Build your two bases
+    const basisIn = angleToBasis(entryAng);
+    const basisOut = angleToBasis(exitAng);
+    // 2) Into entry's local coords
+    let localVel = worldVectorToLocal(velIn, basisIn);
+    // 4) Back out through exit's frame
+    return localVectorToWorld(localVel, basisOut);
+}
+export function teleportThroughPortal(TPentity, entryPortal, exitPortal) {
+    if (TPentity.GetClassName() === "player") {
+        const pawn = TPentity;
+        const state = playerStates[pawn.GetPlayerController().GetPlayerSlot()];
+        if (!state) {
+            return;
+        }
+        const now = Instance.GetGameTime();
+        if (now - state.lastPortalTime < 0.2) {
+            return;
+        }
+        state.lastPortalTime = now;
+    }
+    else {
+        if (!TPentity.GetEntityName() || TPentity.GetEntityName().length === 0) {
+            TPentity.SetEntityName(`teleported_${Instance.GetGameTime()}`);
+        }
+    }
+    // 1) Читаем входную позицию игрока
+    const posIn = TPentity.GetLocalOrigin();
+    const velIn = TPentity.GetAbsVelocity();
+    // 2) Читаем параметры входного портала
+    const oriIn = entryPortal.GetAbsOrigin();
+    const angIn = entryPortal.GetAbsAngles();
+    // 3) Читаем параметры выходного портала
+    const oriOut = exitPortal.GetAbsOrigin();
+    const angOut = exitPortal.GetAbsAngles();
+    // 4) Строим базисы порталов
+    const basisIn = angleToBasis(angIn);
+    const basisOut = angleToBasis(angOut);
+    // 5) Переводим позицию в локальные coords входного портала
+    const localPos = worldToLocal(posIn, oriIn, basisIn);
+    // 6) Переводим обратно в мировые coords через выходной портал
+    let newPos = localToWorld(localPos, oriOut, basisOut);
+    // 7) Выталкиваем игрока наружу из поверхности
+    //    – angleToVector(angOut) указывает внутрь стены/пола/потолка,
+    //      поэтому просто его инвертируем
+    const rawF = angleToVector(angOut);
+    const outward = { x: -rawF.x, y: -rawF.y, z: -rawF.z };
+    const PUSH = 0;
+    if (outward.z < -.9) {
+        // ориджин в ногах, нехорошо..
+        newPos.z -= 72;
+    }
+    newPos = {
+        x: newPos.x + outward.x * PUSH,
+        y: newPos.y + outward.y * PUSH,
+        z: newPos.z + outward.z * PUSH
+    };
+    let oldRotation;
+    if (TPentity.GetClassName() === "player") {
+        oldRotation = TPentity.GetEyeAngles();
+    }
+    else {
+        oldRotation = TPentity.GetAbsAngles();
+    }
+    const entryA = entryPortal.GetAbsAngles();
+    const exitA = exitPortal.GetAbsAngles();
+    const newEye = simulateRotationThroughPortal(oldRotation, entryA, exitA);
+    const newVel = simulateVelocityThroughPortal(velIn, entryPortal.GetAbsAngles(), exitPortal.GetAbsAngles());
+    if (Math.abs(velIn.z) < 0.1) {
+        newVel.z += outward.z * 256;
+    }
+    TPentity.Teleport({position: newPos, angles: newEye, velocity: newVel});
+    //debugBasis(exitPortal, 32, 15);
+}
+function GetPawnNear(position, radius) {
+    const players = Instance.FindEntitiesByClass("player");
+    let currentPlayer = undefined;
+    let currentDistance = radius * radius;
+    for (const player of players) {
+        if (!player || !player.IsValid())
+            continue;
+        const origin = player.GetLocalOrigin();
+        const dx = origin.x - position.x;
+        const dy = origin.y - position.y;
+        const dz = origin.z - position.z;
+        const distanceSquared = dx * dx + dy * dy + dz * dz;
+        if (distanceSquared <= radius * radius) {
+            currentDistance = distanceSquared;
+            currentPlayer = player;
+        }
+    }
+    return currentPlayer;
+}
+
+// Instance.ServerCommand("sv_cheats 1");
+// Instance.ServerCommand("sv_falldamage_scale 0");
+// Instance.ServerCommand("bot_stop 1");
+// Instance.ServerCommand("mp_warmup_offline_enabled 1");
+// Instance.ServerCommand("mp_warmup_pausetimer 1");
+// Instance.ServerCommand("weapon_air_spread_scale 0");
+// Instance.ServerCommand("sv_infinite_ammo 1");
+
+Instance.OnScriptInput("tryPortalling", (context) => {
+    // Instance.Msg("Trying portalling for " + context.activator?.GetEntityName() + " using " + context.caller?.GetEntityName());
+    const activator = context.activator;
+    const portal = context.caller;
+    const isBlue = portal.GetEntityName().includes("blue");
+    const name = portal.GetEntityName();
+    const parts = name.split("_");
+    const suffix = parts[parts.length - 1];
+    // Instance.Msg(`Portal suffix = ${suffix}`);
+    let secondPortal;
+    if (isBlue) {
+        secondPortal = Instance.FindEntityByName(`des_blue_portal_${suffix}`);
+    }
+    else {
+        secondPortal = Instance.FindEntityByName(`des_orange_portal_${suffix}`);
+    }
+    teleportThroughPortal(activator, portal, secondPortal);
+});
+
+Instance.OnScriptInput("angleFix", (context) => {
+    // Instance.Msg("Trying fix angle for " + context.activator?.GetEntityName());
+    const activator = context.activator;
+    const eyeAngles = activator.GetEyeAngles();
+    // Instance.Msg("eyeAngles.pitch" + eyeAngles.pitch);
+    // 1) Convert eye QAngle to forward vector
+    const eyeDir = angleToVector(eyeAngles);
+    eyeDir.z = -eyeDir.z;
+    // 2) Re-derive a QAngle from that world vector
+    const newEyeAngles = vectorToAngles(eyeDir);
+    
+    activator.Teleport({position: activator.GetAbsOrigin(), angles: newEyeAngles, velocity: activator.GetAbsVelocity()});
+});
