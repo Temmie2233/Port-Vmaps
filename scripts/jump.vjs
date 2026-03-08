@@ -1,0 +1,112 @@
+import { Instance, CSInputs } from "cs_script/point_script";
+
+//Instance.Msg("========== 脚本加载成功: 右键起飞脚本 ==========\n");
+
+const playersInTrigger = new Map();
+let isThinking = false; 
+
+// 1. SetThink 只能在脚本最外层注册一次！
+Instance.SetThink(() => {
+    // 如果当前没有任何玩家在 Trigger 内
+    if (playersInTrigger.size === 0) {
+        if (isThinking) {
+            //Instance.Msg("[ThinkLoop] 区域内无玩家，轮询已休眠 (暂停调度)。\n");
+            isThinking = false;
+        }
+        return; 
+    }
+
+    // 只要还有人，就设定下一 Tick 继续执行
+    Instance.SetNextThink(Instance.GetGameTime());
+    
+    const currentTime = Instance.GetGameTime();
+
+    // 遍历所有在 Trigger 内的玩家
+    for (const [pawn, state] of playersInTrigger.entries()) {
+        
+        if (!pawn || !pawn.IsValid()) {
+            playersInTrigger.delete(pawn);
+            continue;
+        }
+
+        // 监听玩家右键
+        if (pawn.WasInputJustPressed(CSInputs.ATTACK2)) {
+            //Instance.Msg(`[Input] 检测到玩家按下了右键！\n`);
+            
+            // 【修复核心】：从玩家实体本身读取冷却时间。如果没跳过，默认为 0
+            const nextJumpTime = pawn.jumpCooldown || 0;
+
+            // 冷却检测
+            if (currentTime >= nextJumpTime) {
+                const currentVel = pawn.GetAbsVelocity();
+                //Instance.Msg(`[Teleport] 正在修改速度！目标Z速度: ${state.force}\n`);
+                
+                pawn.Teleport({
+                    velocity: { 
+                        x: currentVel.x, 
+                        y: currentVel.y, 
+                        z: state.force 
+                    }
+                });
+
+                // 【更新冷却时间】：直接写到 pawn 实体上。
+                // 这样即使他离开 Trigger 被从 Map 中 delete，冷却时间依然保存在他身上！
+                pawn.jumpCooldown = currentTime + 0.5;
+            } else {
+                //Instance.Msg(`[Input] 触发太快，处于冷却中拦截。\n`);
+            }
+        }
+    }
+});
+
+// 2. 新增一个专门用来“唤醒”轮询的函数
+function WakeUpThink() {
+    if (!isThinking) {
+        isThinking = true;
+        //Instance.Msg("[ThinkLoop] 轮询已被唤醒！\n");
+        Instance.SetNextThink(Instance.GetGameTime());
+    }
+}
+
+function Init() {
+    //Instance.Msg("========== point_script 实体已激活 ==========\n");
+    
+    // 玩家进入 Trigger
+    Instance.OnScriptInput("EnterTrigger", (inputData) => {
+        const pawn = inputData.activator; 
+        const trigger = inputData.caller; 
+        
+        if (pawn && pawn.IsValid() && typeof pawn.WasInputJustPressed === "function") {
+            
+            let boostForce = 200; 
+            
+            // 动态读取力度
+            if (trigger && trigger.IsValid()) {
+                const triggerName = trigger.GetEntityName(); 
+                const match = triggerName.match(/\d+/);      
+                if (match) {
+                    boostForce = parseInt(match[0], 10);     
+                }
+            }
+
+            // 存入 Map：现在只需要存力度，不需要存冷却时间了
+            playersInTrigger.set(pawn, {
+                force: boostForce
+            });
+            
+            // 唤醒早已注册好的轮询
+            WakeUpThink(); 
+        }
+    });
+
+    // 玩家离开 Trigger
+    Instance.OnScriptInput("LeaveTrigger", (inputData) => {
+        const pawn = inputData.activator;
+        if (pawn) {
+            playersInTrigger.delete(pawn);
+        }
+    });
+}
+
+Instance.OnActivate(Init);
+Instance.OnScriptReload({ after: Init });
